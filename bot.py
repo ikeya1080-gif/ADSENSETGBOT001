@@ -28,7 +28,7 @@ def _require_env(name):
         raise SystemExit(f"❌ Environment variable {name} set nahi hai. Railway > Variables me add karo.")
     return val
 
-BOT_TOKEN = _require_env("BOT_TOKEN")
+BOT_TOKEN = "8997744670:AAGoEfN3w7sl9x77w9SCe5OfXj24ZEoGbcA"
 try:
     ADMIN_ID = int(_require_env("ADMIN_ID"))
 except ValueError:
