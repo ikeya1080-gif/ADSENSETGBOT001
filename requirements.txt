@@ -1,0 +1,2 @@
+Telethon==1.42.0
+uvloop>=0.19
