@@ -18,6 +18,7 @@ import telethon.errors as _tgerr
 from telethon.tl.functions.updates import GetStateRequest
 from telethon.sessions import StringSession
 import telethon
+from telethon.tl import types as _tltypes   # FIX: entity classes resolved from the installed Telethon
 
 # ─────────────────────────── CONFIG ──────────────────────────
 # Railway me sirf 2 variables set karne hain:  BOT_TOKEN  aur  ADMIN_ID
@@ -192,6 +193,144 @@ def msgs_list(j):
         return v if isinstance(v, list) else [str(v)]
     except Exception:
         return [j] if j else []
+
+# ───────────────── ENTITY HELPERS (Premium Custom Emoji safe) ─────────────────
+# FIX: ONE shared implementation for capture / edit / send-now / scheduler.
+# Entities are stored as JSON dicts inside the EXISTING scheduled_tasks.msg_ids_json
+# field (no schema change).  Offsets/lengths are stored exactly as Telegram supplied
+# them (UTF-16 code units) and are never recalculated, except for the exact UTF-16
+# length of a stripped prefix when leading whitespace is removed from the text.
+_ENTITY_NAMES = (
+    "MessageEntityBold", "MessageEntityItalic", "MessageEntityCode", "MessageEntityPre",
+    "MessageEntityUnderline", "MessageEntityStrike", "MessageEntityBlockquote",
+    "MessageEntitySpoiler", "MessageEntityTextUrl", "MessageEntityCustomEmoji",
+)
+ENTITY_MAP = {n: getattr(_tltypes, n) for n in _ENTITY_NAMES if hasattr(_tltypes, n)}
+
+def _u16len(t):
+    """Length of a str in UTF-16 code units (Telegram's offset unit)."""
+    return len((t or "").encode("utf-16-le")) // 2
+
+def entity_to_dict(e):
+    d = {"type": type(e).__name__, "offset": e.offset, "length": e.length,
+         "data": getattr(e, "url", None) or getattr(e, "language", None)}
+    # FIX: Preserve Telegram Custom Emoji document_id (stored as str -> JSON-safe for 64-bit ids)
+    if type(e).__name__ == "MessageEntityCustomEmoji":
+        d["document_id"] = str(e.document_id)
+    if getattr(e, "collapsed", None):          # newer Telethon: collapsible blockquote
+        d["collapsed"] = True
+    return d
+
+def entities_to_json(raw_text, entities, cp_start=0, cp_end=None):
+    """Serialise supported entities of `raw_text` (optionally only for raw_text[cp_start:cp_end]).
+    Returns a JSON string ("[]" when nothing to keep)."""
+    if not entities: return "[]"
+    raw_text = raw_text or ""
+    if cp_end is None: cp_end = len(raw_text)
+    lo, hi = _u16len(raw_text[:cp_start]), _u16len(raw_text[:cp_end])
+    out = []
+    for e in entities:
+        try:
+            if type(e).__name__ not in ENTITY_MAP: continue
+            d = entity_to_dict(e)
+            st, en = max(e.offset, lo), min(e.offset + e.length, hi)
+            if en <= st: continue
+            d["offset"], d["length"] = st - lo, en - st
+            out.append(d)
+        except Exception as ex:
+            print(f"⚠️ entity serialise skipped ({type(ex).__name__}: {ex})")
+    return json.dumps(out)
+
+def capture_text_and_entities(message, fallback_text, cp_start=None, cp_end=None):
+    """Return (text, ents_json) for a received bot message.
+    No supported entities -> (fallback_text, "[]")  == exactly the old behaviour.
+    With entities -> raw Telegram text (message.message) + entities, so custom emoji survive."""
+    try:
+        raw = message.message or ""
+        if cp_start is None: cp_start, cp_end = 0, len(raw)
+        seg = raw[cp_start:cp_end]
+        if not seg.strip(): return fallback_text, "[]"
+        s0 = cp_start + (len(seg) - len(seg.lstrip()))
+        e0 = cp_start + len(seg.rstrip())
+        ej = entities_to_json(raw, message.entities, s0, e0)
+        if ej == "[]": return fallback_text, "[]"
+        return raw[s0:e0], ej
+    except Exception as ex:
+        print(f"⚠️ entity capture failed, using plain text ({type(ex).__name__}: {ex})")
+        return fallback_text, "[]"
+
+def message_has_media(message):
+    m = getattr(message, "media", None)
+    return bool(m) and type(m).__name__ != "MessageMediaWebPage"
+
+def rebuild_entities(ej, text=None, ctx=""):
+    """JSON (new OR old format) -> list of Telethon entities, or None.
+    A malformed entity is logged and skipped; it never drops the others."""
+    if not ej: return None
+    try:
+        elist = json.loads(ej) if isinstance(ej, (str, bytes)) else ej
+    except Exception as ex:
+        print(f"⚠️ [{ctx}] entity JSON unreadable ({type(ex).__name__})"); return None
+    if isinstance(elist, dict): elist = [elist]
+    if not isinstance(elist, list): return None
+    limit  = _u16len(text) if text is not None else None
+    result = []
+    for ed in elist:
+        try:
+            if not isinstance(ed, dict): continue
+            name = ed.get("type"); cls = ENTITY_MAP.get(name)
+            if not cls: continue
+            off, ln = int(ed["offset"]), int(ed["length"])
+            if off < 0 or ln <= 0: continue
+            if limit is not None and off + ln > limit:
+                print(f"⚠️ [{ctx}] {name} out of bounds ({off}+{ln}>{limit}) — skipped"); continue
+            d = ed.get("data")
+            if name == "MessageEntityCustomEmoji":
+                did = ed.get("document_id")
+                if did in (None, ""):      # old record: id was never saved -> cannot rebuild
+                    print(f"⚠️ [{ctx}] custom emoji without document_id (old task) — skipped"); continue
+                # FIX: Rebuild MessageEntityCustomEmoji with offset, length AND document_id
+                result.append(cls(offset=off, length=ln, document_id=int(did)))
+            elif name == "MessageEntityTextUrl":
+                if not d: continue
+                result.append(cls(offset=off, length=ln, url=d))
+            elif name == "MessageEntityPre":
+                result.append(cls(offset=off, length=ln, language=d or ""))   # language is required
+            elif name == "MessageEntityBlockquote" and ed.get("collapsed"):
+                try: result.append(cls(offset=off, length=ln, collapsed=True))
+                except TypeError: result.append(cls(offset=off, length=ln))
+            else:
+                result.append(cls(offset=off, length=ln))
+        except Exception as ex:
+            print(f"⚠️ [{ctx}] bad entity skipped ({type(ex).__name__}: {ex})")
+    return result or None
+
+def parse_msg_ids_json(raw_json):
+    """Tolerant reader for scheduled_tasks.msg_ids_json -> (pairs, ents_all).
+    Handles: new dict {"pairs","ents"}, old dict, old plain list, '[]', NULL, garbage."""
+    try:
+        raw = json.loads(raw_json or "{}")
+    except Exception:
+        return [], []
+    if isinstance(raw, dict):
+        pairs, ents = raw.get("pairs", []), raw.get("ents", [])
+    elif isinstance(raw, list):
+        pairs, ents = [], raw
+    else:
+        return [], []
+    if not isinstance(pairs, list): pairs = []
+    if not isinstance(ents, list):  ents = []
+    if ents and all(isinstance(x, dict) for x in ents):   # flat entity list of ONE message
+        ents = [ents]
+    return pairs, ents
+
+def pad_capture(st):
+    """FIX: keep msg_ids / peers / entities_list / media_flags index-aligned with messages
+    (text-typed messages used to append only to `messages`, shifting every later index)."""
+    n = len(st.get("messages", []))
+    for k, fill in (("msg_ids", None), ("peers", None), ("entities_list", "[]"), ("media_flags", False)):
+        lst = st.setdefault(k, [])
+        while len(lst) < n: lst.append(fill)
 
 def gen_code(n=10):
     return "".join(secrets.choice(string.ascii_uppercase + string.digits) for _ in range(n))
@@ -520,85 +659,66 @@ async def run_task(task_id, uid, phone, sess, interval, initial_delay=0):
                 task_row2 = c.execute(
                     "SELECT msg_ids_json FROM scheduled_tasks WHERE id=?", (task_id,)
                 ).fetchone()
-                fwd_data   = {}
-                fwd_pairs2 = []
-                ents_all   = []
-                try:
-                    raw = json.loads(task_row2[0] or "{}") if task_row2 else {}
-                    if isinstance(raw, dict):
-                        # New format: {"pairs": [...], "ents": [...]}
-                        fwd_pairs2 = raw.get("pairs", [])
-                        ents_all   = raw.get("ents", [])
-                    elif isinstance(raw, list):
-                        # Old format: list of entities
-                        ents_all   = raw
-                except: pass
-                ents_json2 = ents_all[idx % len(ents_all)] if ents_all else None
-                fwd_pair   = fwd_pairs2[idx % len(fwd_pairs2)] if fwd_pairs2 else None
+                fwd_pairs2, ents_all = parse_msg_ids_json(task_row2[0] if task_row2 else None)
+                msg_i = idx % len(msgs)
+                # FIX: only trust per-message lists that are aligned with messages_json
+                # (old tasks could be misaligned -> wrong entities / wrong forwarded message)
+                ents_json2 = ents_all[msg_i] if len(ents_all) == len(msgs) else None
+                fwd_pair   = fwd_pairs2[msg_i] if len(fwd_pairs2) == len(msgs) else None
+                if not isinstance(fwd_pair, (list, tuple)): fwd_pair = None
                 orig_mid   = fwd_pair[0] if fwd_pair and len(fwd_pair) > 0 else None
                 orig_peer2 = fwd_pair[1] if fwd_pair and len(fwd_pair) > 1 else None
+                fwd_media  = bool(fwd_pair[2]) if fwd_pair and len(fwd_pair) > 2 else False
+                legacy_pair = bool(fwd_pair) and len(fwd_pair) <= 2     # saved before this fix
 
-                # Rebuild Telethon entities from JSON
-                from telethon.tl.types import (
-                    MessageEntityBold, MessageEntityItalic, MessageEntityCode,
-                    MessageEntityPre, MessageEntityTextUrl, MessageEntityUnderline,
-                    MessageEntityStrike, MessageEntityBlockquote, MessageEntityCustomEmoji,
-                    MessageEntitySpoiler
-                )
-                ENTITY_MAP = {
-                    "MessageEntityBold":        MessageEntityBold,
-                    "MessageEntityItalic":      MessageEntityItalic,
-                    "MessageEntityCode":        MessageEntityCode,
-                    "MessageEntityPre":         MessageEntityPre,
-                    "MessageEntityUnderline":   MessageEntityUnderline,
-                    "MessageEntityStrike":      MessageEntityStrike,
-                    "MessageEntityBlockquote":  MessageEntityBlockquote,
-                    "MessageEntitySpoiler":     MessageEntitySpoiler,
-                    "MessageEntityTextUrl":     MessageEntityTextUrl,
-                    "MessageEntityCustomEmoji": MessageEntityCustomEmoji,
-                }
+                # FIX: Rebuild MessageEntityCustomEmoji (+ all other entities) from JSON
+                entities_to_use = rebuild_entities(ents_json2, text=msg, ctx=f"task #{task_id} msg {msg_i+1}")
+                # FIX: log only counts (never secrets) so Railway logs show if custom emoji are really being sent
+                if entities_to_use:
+                    _n_ce = sum(1 for _e in entities_to_use if type(_e).__name__ == "MessageEntityCustomEmoji")
+                    print(f"Task #{task_id} msg {msg_i+1}: {len(entities_to_use)} entities ({_n_ce} custom emoji) will be sent natively")
+                elif ents_json2 and ents_json2 != "[]":
+                    print(f"⚠️ Task #{task_id} msg {msg_i+1}: stored entities unusable — sending without formatting")
 
-                def rebuild_entities(ej):
-                    if not ej: return None
-                    try:
-                        elist = json.loads(ej) if isinstance(ej, str) else ej
-                        result = []
-                        for ed in elist:
-                            cls = ENTITY_MAP.get(ed.get("type"))
-                            if not cls: continue
-                            d = ed.get("data")
-                            if ed["type"] == "MessageEntityTextUrl" and d:
-                                result.append(cls(offset=ed["offset"], length=ed["length"], url=d))
-                            elif ed["type"] == "MessageEntityPre" and d:
-                                result.append(cls(offset=ed["offset"], length=ed["length"], language=d))
-                            else:
-                                try: result.append(cls(offset=ed["offset"], length=ed["length"]))
-                                except: pass
-                        return result if result else None
-                    except: return None
+                # FIX: Prefer native entity sending when formatting is available.
+                # Forward only when: media is involved, OR there are no entities to preserve,
+                # OR the task is an old (pre-fix) record — old behaviour kept for those.
+                prefer_forward = bool(orig_mid and orig_peer2) and (
+                    legacy_pair or fwd_media or not entities_to_use)
 
-                entities_to_use = rebuild_entities(ents_json2)
+                async def _send_one(target):
+                    if prefer_forward:
+                        try:
+                            await cl.forward_messages(target, orig_mid, orig_peer2)
+                            return
+                        except FloodWaitError:
+                            raise
+                        except Exception:
+                            if fwd_media or not msg: raise      # media can't be degraded to text
+                    if entities_to_use:
+                        await cl.send_message(target, msg, formatting_entities=entities_to_use)
+                    else:
+                        await cl.send_message(target, msg)
 
                 all_targets = [g.entity for g in groups]
                 sent = 0
+                first_err = None
 
                 for target in all_targets:
                     try:
-                        if orig_mid and orig_peer2:
-                            await cl.forward_messages(target, orig_mid, orig_peer2)
-                        elif entities_to_use:
-                            await cl.send_message(target, msg, formatting_entities=entities_to_use)
-                        else:
-                            await cl.send_message(target, msg)
+                        await _send_one(target)
                         sent += 1
                         await asyncio.sleep(1)
                     except FloodWaitError as fw:
                         await asyncio.sleep(fw.seconds + 10)
                         try:
-                            await cl.send_message(target, msg)
+                            await _send_one(target)   # FIX: retry the SAME way (entities kept), not plain text
                             sent += 1
                         except Exception: pass
-                    except Exception: pass
+                    except Exception as ex:
+                        if first_err is None: first_err = f"{type(ex).__name__}: {ex}"
+                if first_err and sent == 0 and entities_to_use:
+                    print(f"⚠️ Task #{task_id}: nothing sent with entities — {first_err}")
 
                 await close(cl)
                 await db_write(
@@ -931,10 +1051,13 @@ async def cmd_sendnow(event):
     ok, _   = await check_access(uid)
     if not ok: await event.reply("❌ Access nahi."); return
     text     = event.pattern_match.group(1).strip()
+    # FIX: keep entities (offsets shifted by the exact "/sendnow " prefix length)
+    text, ents_js = capture_text_and_entities(event.message, text,
+                        event.pattern_match.start(1), event.pattern_match.end(1))
     accounts = c.execute("SELECT phone,session_str FROM user_accounts WHERE user_id=?", (uid,)).fetchall()
     if not accounts: await event.reply("❌ Koi account nahi."); return
     msg = await event.reply("📤 Sending...")
-    await _send_now_core(msg, uid, text, accounts)
+    await _send_now_core(msg, uid, text, accounts, ents_js)
 
 # ─────────────────────────── /schedule ───────────────────────
 @bot.on(events.NewMessage(pattern=r"^/schedule$"))
@@ -2056,15 +2179,13 @@ async def on_forward(event):
             orig_id   = fwd.saved_from_msg_id
             orig_peer = getattr(getattr(fwd, "saved_from_peer", None), "channel_id", None)
 
-    # Fallback entities from current message
-    entities  = event.message.entities or []
-    def entity_to_dict(e):
-        return {"type": type(e).__name__, "offset": e.offset, "length": e.length,
-                "data": getattr(e, "url", None) or getattr(e, "language", None)}
-    ents_json = json.dumps([entity_to_dict(e) for e in entities])
+    # Entities from current message (FIX: shared helper keeps CustomEmoji document_id)
+    ents_json = entities_to_json(text, event.message.entities)
+    has_media = message_has_media(event.message)
 
     st = pending.get(uid, {})
     if st.get("action") == "await_msg" and st.get("mode") == "schedule":
+        pad_capture(st)                            # FIX: keep lists aligned with messages
         msgs      = st.setdefault("messages", [])
         msg_ids   = st.setdefault("msg_ids", [])   # original msg IDs
         peers     = st.setdefault("peers", [])      # original chat/channel IDs
@@ -2073,6 +2194,7 @@ async def on_forward(event):
         msg_ids.append(orig_id)
         peers.append(orig_peer)
         ents_list.append(ents_json)
+        st.setdefault("media_flags", []).append(has_media)
         has_src = "✅ Original source mila!" if orig_id and orig_peer else "⚠️ Source nahi mila, entities use hongi"
         await event.reply(
             f"📩 **Message #{len(msgs)} added!**\n{has_src}\n`{text[:80]}`",
@@ -2087,7 +2209,10 @@ async def on_forward(event):
         pending.pop(uid, None)
         await db_write(
             "UPDATE scheduled_tasks SET messages_json=?, msg_ids_json=?, source_chat_id=? WHERE id=?",
-            (json.dumps([text]), json.dumps([orig_id]), orig_peer, tid)
+            # FIX: new-format JSON (pairs + entities) instead of a bare [orig_id] list that was misread as entities
+            (json.dumps([text]),
+             json.dumps({"pairs": [[orig_id, orig_peer, has_media]], "ents": [ents_json]}),
+             orig_peer, tid)
         )
         if tid in scheduler_tasks:
             scheduler_tasks[tid].cancel(); del scheduler_tasks[tid]
@@ -2105,7 +2230,7 @@ async def on_forward(event):
         pending[uid] = {
             "action":  "msg_ready", "text": text,
             "orig_id": orig_id,     "orig_peer": orig_peer,
-            "ents_json": ents_json
+            "ents_json": ents_json, "has_media": has_media
         }
         await event.reply(
             f"📩 **Forward detect hua!**\n`{text[:100]}`\n\nKya karna hai?",
@@ -2148,21 +2273,29 @@ async def cb_do_send_now(event):
     uid = event.sender_id
     if uid not in pending or pending[uid].get("action") != "msg_ready":
         await event.answer("Koi message nahi.", alert=True); return
-    text     = pending.pop(uid)["text"]
+    _p       = pending.pop(uid)
+    text     = _p["text"]
+    ents_js  = _p.get("ents_json")            # FIX: carry entities (custom emoji) into Send Now
     accounts = c.execute("SELECT phone,session_str FROM user_accounts WHERE user_id=?", (uid,)).fetchall()
     if not accounts and is_admin(uid):
         accounts = c.execute("SELECT phone,session_str FROM user_accounts").fetchall()
     if not accounts: await event.edit("❌ Koi account nahi."); return
     await event.edit("📤 Sending...", parse_mode='md')
-    await _send_now_core(event, uid, text, accounts)
+    await _send_now_core(event, uid, text, accounts, ents_js)
 
 @bot.on(events.CallbackQuery(data=b"do_schedule"))
 async def cb_do_schedule(event):
     uid = event.sender_id
     if uid not in pending or pending[uid].get("action") != "msg_ready":
         await event.answer("Koi message nahi.", alert=True); return
-    text = pending[uid].pop("text")
-    pending[uid].update({"action": "schedule_pick_account", "messages": [text]})
+    _p   = pending[uid]
+    text = _p.pop("text")
+    # FIX: seed capture lists so the first message keeps its entities (custom emoji).
+    # Pair stays None: this message was always sent as text (not forwarded) — behaviour unchanged.
+    _p.update({"action": "schedule_pick_account", "messages": [text],
+               "msg_ids": [None], "peers": [None],
+               "entities_list": [_p.get("ents_json") or "[]"],
+               "media_flags": [False]})
     await _show_acct_picker(event, uid)
 
 @bot.on(events.CallbackQuery(data=b"view_tasks"))
@@ -2265,13 +2398,15 @@ async def _finalize_task(event, uid, send_to):
     phone = data.get("selected_phone")
     sess  = data.get("selected_sess")
     iv_sec= data.get("iv_sec", 1800)
+    pad_capture(data)                          # FIX: guarantee index alignment with msgs
     ents_list  = data.get("entities_list", [])
     msg_ids    = data.get("msg_ids", [])
     peers      = data.get("peers", [])
+    media_flags= data.get("media_flags", [])
     source_cid = data.get("source_chat_id") or (peers[0] if peers else None)
     custom_tgts= data.get("custom_targets", [])
     # Store peers as msg_ids_json combined: [[msg_id, peer], ...]
-    fwd_pairs  = [[mid, peer] for mid, peer in zip(msg_ids, peers)]
+    fwd_pairs  = [[mid, peer, bool(mf)] for mid, peer, mf in zip(msg_ids, peers, media_flags)]
     if not phone:
         row = c.execute("SELECT phone,session_str FROM user_accounts WHERE user_id=?", (uid,)).fetchone()
         if not row and is_admin(uid):
@@ -2569,8 +2704,9 @@ async def _do_redeem(ctx, uid, code):
         buttons=main_kb()
     )
 
-async def _send_now_core(status_msg, uid, text, accounts):
+async def _send_now_core(status_msg, uid, text, accounts, ents_json=None):
     total = 0; lines = []
+    ents_now = rebuild_entities(ents_json, text=text, ctx="send-now")   # FIX: keep entities (custom emoji)
     for phone, sess in accounts:
         cl = await open_client(phone, sess)
         if not cl: lines.append(f"📵 `{phone}`: fail"); continue
@@ -2580,7 +2716,10 @@ async def _send_now_core(status_msg, uid, text, accounts):
             sent   = 0
             for g in groups:
                 try:
-                    await cl.send_message(g.entity, text)
+                    if ents_now:
+                        await cl.send_message(g.entity, text, formatting_entities=ents_now)
+                    else:
+                        await cl.send_message(g.entity, text)
                     sent += 1; total += 1; await asyncio.sleep(1)
                 except FloodWaitError as fw: await asyncio.sleep(fw.seconds + 5)
                 except Exception: pass
@@ -2827,11 +2966,20 @@ async def on_text(event):
             if not accounts and is_admin(uid):
                 accounts = c.execute("SELECT phone,session_str FROM user_accounts").fetchall()
             if not accounts: await event.reply("❌ Koi account nahi."); return
+            # FIX: capture raw text + entities (custom emoji) instead of markdown text only
+            text, ents_js = capture_text_and_entities(event.message, text)
             msg = await event.reply("📤 Sending...")
-            await _send_now_core(msg, uid, text, accounts)
+            await _send_now_core(msg, uid, text, accounts, ents_js)
         else:
+            # FIX: capture raw text + entities; keep all per-message lists aligned
+            text, ents_js = capture_text_and_entities(event.message, text)
+            pad_capture(pending[uid])
             msgs = pending[uid].setdefault("messages", [])
             msgs.append(text)
+            pending[uid]["msg_ids"].append(None)
+            pending[uid]["peers"].append(None)
+            pending[uid]["entities_list"].append(ents_js)
+            pending[uid]["media_flags"].append(False)
             await event.reply(
                 f"✅ **Message #{len(msgs)} saved!**\n`{text[:100]}`",
                 buttons=[
@@ -2950,10 +3098,11 @@ async def on_text(event):
         if not tid:
             await event.reply("❌ Session expire ho gaya. Dobara try karo.", parse_mode='md')
             return
-        # Save new message text
+        # FIX: Edit keeps entities (custom emoji) — stored in the existing msg_ids_json field
+        text, ents_js = capture_text_and_entities(event.message, text)
         await db_write(
-            "UPDATE scheduled_tasks SET messages_json=?, msg_ids_json='[]', source_chat_id=NULL WHERE id=?",
-            (json.dumps([text]), tid)
+            "UPDATE scheduled_tasks SET messages_json=?, msg_ids_json=?, source_chat_id=NULL WHERE id=?",
+            (json.dumps([text]), json.dumps({"pairs": [[None, None, False]], "ents": [ents_js]}), tid)
         )
         # Restart task if running
         if tid in scheduler_tasks:
